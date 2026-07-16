@@ -1,9 +1,11 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { deleteViolationAction } from "@/app/actions";
 
 export function DeleteButton({ violationId }: { violationId: string }) {
+  const router = useRouter();
   const [isDeleting, setIsDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -15,11 +17,12 @@ export function DeleteButton({ violationId }: { violationId: string }) {
 
     try {
       const result = await deleteViolationAction(violationId);
-      if (result?.error) {
+      if ("error" in result) {
         setError(result.error);
         setIsDeleting(false);
+      } else {
+        router.push(`/?date=${result.date}`);
       }
-      // On success the action redirects — this component unmounts.
     } catch {
       setError("Something went wrong. Please try again.");
       setIsDeleting(false);

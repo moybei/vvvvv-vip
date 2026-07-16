@@ -1,6 +1,7 @@
 import Image from "next/image";
 import Link from "next/link";
-import { PlateChip } from "@/components/PlateChip";
+import { PlateChipLink } from "@/components/PlateChipLink";
+import { formatMalaysiaTime } from "@/lib/datetime";
 import type { ViolationWithDetails } from "@/lib/types";
 
 export function ViolationCard({ violation }: { violation: ViolationWithDetails }) {
@@ -34,7 +35,7 @@ export function ViolationCard({ violation }: { violation: ViolationWithDetails }
         {violation.plates.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {violation.plates.map((p) => (
-              <PlateChip key={p.id} plateText={p.plate_text} occurrenceCount={p.occurrenceCount} />
+              <PlateChipLink key={p.id} plateText={p.plate_text} occurrenceCount={p.occurrenceCount} />
             ))}
           </div>
         )}
@@ -42,7 +43,7 @@ export function ViolationCard({ violation }: { violation: ViolationWithDetails }
           {violation.description || "No description."}
         </p>
         <div className="mt-auto pt-1 text-right text-xs text-foreground/45">
-          {new Date(violation.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+          {formatMalaysiaTime(violation.created_at)}
         </div>
       </div>
     </Link>

@@ -1,12 +1,23 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import imageCompression from "browser-image-compression";
-import { format } from "date-fns";
 import { createViolationAction } from "@/app/actions";
 import { normalizePlate } from "@/lib/plate";
+import { todayInMalaysia } from "@/lib/datetime";
 
-type ImageItem = { file: File; previewUrl: string };
+type UploadResult = { imagePath: string; thumbPath: string; width: number; height: number };
+
+type UploadItem = {
+  id: string;
+  file: File;
+  previewUrl: string;
+  status: "uploading" | "done" | "error";
+  progress: number;
+  error?: string;
+  result?: UploadResult;
+};
 
 const COMPRESS_OPTIONS = {
   maxWidthOrHeight: 2200,
@@ -15,47 +26,120 @@ const COMPRESS_OPTIONS = {
   fileType: "image/jpeg",
 };
 
+function uploadPhotoXHR(
+  file: File,
+  date: string,
+  onProgress: (pct: number) => void,
+  registerXhr: (xhr: XMLHttpRequest) => void,
+): Promise<UploadResult> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    registerXhr(xhr);
+    xhr.open("POST", "/api/upload-photo");
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      let body: unknown;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        reject(new Error("Unexpected response from server."));
+        return;
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as UploadResult);
+      } else {
+        const message =
+          body && typeof body === "object" && "error" in body
+            ? String((body as { error: unknown }).error)
+            : "Upload failed.";
+        reject(new Error(message));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Network error during upload."));
+    xhr.onabort = () => reject(new Error("Upload cancelled."));
+
+    const formData = new FormData();
+    formData.set("date", date);
+    formData.set("image", file);
+    xhr.send(formData);
+  });
+}
+
 export function UploadForm({ defaultDate }: { defaultDate: string }) {
+  const router = useRouter();
   const [date, setDate] = useState(defaultDate);
   const [description, setDescription] = useState("");
   const [plateInput, setPlateInput] = useState("");
   const [plates, setPlates] = useState<string[]>([]);
-  const [images, setImages] = useState<ImageItem[]>([]);
-  const [isCompressing, setIsCompressing] = useState(false);
+  const [items, setItems] = useState<UploadItem[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const xhrById = useRef(new Map<string, XMLHttpRequest>());
+  const itemsRef = useRef<UploadItem[]>([]);
 
   useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+
+  useEffect(() => {
+    const xhrMap = xhrById.current;
     return () => {
-      images.forEach((img) => URL.revokeObjectURL(img.previewUrl));
+      itemsRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+      xhrMap.forEach((xhr) => xhr.abort());
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  function updateItem(id: string, patch: Partial<UploadItem>) {
+    setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  }
+
+  function startUpload(id: string, file: File) {
+    updateItem(id, { status: "uploading", progress: 0, error: undefined });
+    uploadPhotoXHR(
+      file,
+      date,
+      (pct) => updateItem(id, { progress: pct }),
+      (xhr) => xhrById.current.set(id, xhr),
+    )
+      .then((result) => updateItem(id, { status: "done", progress: 100, result }))
+      .catch((err: Error) => updateItem(id, { status: "error", error: err.message }))
+      .finally(() => xhrById.current.delete(id));
+  }
 
   async function handleFilesSelected(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return;
-    setIsCompressing(true);
     setError(null);
-    try {
-      const newItems: ImageItem[] = [];
-      for (const file of Array.from(fileList)) {
-        const compressed = await imageCompression(file, COMPRESS_OPTIONS);
-        newItems.push({ file: compressed, previewUrl: URL.createObjectURL(compressed) });
+
+    for (const file of Array.from(fileList)) {
+      const id = crypto.randomUUID();
+      let compressed: File;
+      try {
+        compressed = await imageCompression(file, COMPRESS_OPTIONS);
+      } catch {
+        setError(`Couldn't process "${file.name}". Try a different file.`);
+        continue;
       }
-      setImages((prev) => [...prev, ...newItems]);
-    } catch {
-      setError("Couldn't process one of the photos. Try a different file.");
-    } finally {
-      setIsCompressing(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
+      const previewUrl = URL.createObjectURL(compressed);
+      setItems((prev) => [
+        ...prev,
+        { id, file: compressed, previewUrl, status: "uploading", progress: 0 },
+      ]);
+      startUpload(id, compressed);
     }
+
+    if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
-  function removeImage(index: number) {
-    setImages((prev) => {
-      URL.revokeObjectURL(prev[index].previewUrl);
-      return prev.filter((_, i) => i !== index);
+  function removeItem(id: string) {
+    xhrById.current.get(id)?.abort();
+    xhrById.current.delete(id);
+    setItems((prev) => {
+      const target = prev.find((item) => item.id === id);
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return prev.filter((item) => item.id !== id);
     });
   }
 
@@ -73,7 +157,14 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (images.length === 0) {
+
+    if (items.some((item) => item.status === "uploading")) {
+      setError("Please wait for photos to finish uploading.");
+      return;
+    }
+
+    const doneItems = items.filter((item) => item.status === "done" && item.result);
+    if (doneItems.length === 0) {
       setError("Add at least one photo.");
       return;
     }
@@ -91,24 +182,26 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
     setIsSubmitting(true);
     setError(null);
 
-    const formData = new FormData();
-    formData.set("date", date);
-    formData.set("description", description);
-    finalPlates.forEach((p) => formData.append("plates", p));
-    images.forEach((img) => formData.append("images", img.file, img.file.name));
-
     try {
-      const result = await createViolationAction(formData);
-      if (result?.error) {
+      const result = await createViolationAction({
+        date,
+        description,
+        plates: finalPlates,
+        images: doneItems.map((item) => item.result!),
+      });
+      if ("error" in result) {
         setError(result.error);
         setIsSubmitting(false);
+      } else {
+        router.push(`/?date=${result.date}#${result.violationId}`);
       }
-      // On success the action redirects — this component unmounts.
     } catch {
       setError("Something went wrong. Please try again.");
       setIsSubmitting(false);
     }
   }
+
+  const hasUploadingItems = items.some((item) => item.status === "uploading");
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-5">
@@ -117,7 +210,7 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
         <input
           type="date"
           value={date}
-          max={format(new Date(), "yyyy-MM-dd")}
+          max={todayInMalaysia()}
           onChange={(e) => setDate(e.target.value)}
           required
           className="w-full rounded-lg border border-black/10 bg-surface px-3 py-2 text-sm dark:border-white/15"
@@ -134,18 +227,47 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
           onChange={(e) => handleFilesSelected(e.target.files)}
           className="block w-full text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-brand-yellow file:px-3 file:py-2 file:text-sm file:font-semibold file:text-brand-dark"
         />
-        {isCompressing && (
-          <p className="mt-1 text-xs text-foreground/50">Processing photos…</p>
-        )}
-        {images.length > 0 && (
+        <p className="mt-1 text-xs text-foreground/50">
+          Photos start uploading as soon as you pick them.
+        </p>
+        {items.length > 0 && (
           <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
-            {images.map((img, i) => (
-              <div key={img.previewUrl} className="group relative aspect-square overflow-hidden rounded-lg border border-black/10 dark:border-white/15">
+            {items.map((item) => (
+              <div
+                key={item.id}
+                className="group relative aspect-square overflow-hidden rounded-lg border border-black/10 dark:border-white/15"
+              >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={img.previewUrl} alt="" className="h-full w-full object-cover" />
+                <img src={item.previewUrl} alt="" className="h-full w-full object-cover" />
+
+                {item.status === "uploading" && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/50 text-white">
+                    <span className="text-xs font-semibold">{item.progress}%</span>
+                    <div className="h-1 w-3/4 overflow-hidden rounded-full bg-white/30">
+                      <div
+                        className="h-full bg-brand-yellow transition-all"
+                        style={{ width: `${item.progress}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {item.status === "error" && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-brand-red/80 p-1 text-center text-white">
+                    <span className="text-[10px] leading-tight">{item.error ?? "Failed"}</span>
+                    <button
+                      type="button"
+                      onClick={() => startUpload(item.id, item.file)}
+                      className="rounded bg-white/20 px-1.5 py-0.5 text-[10px] font-semibold"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
+
                 <button
                   type="button"
-                  onClick={() => removeImage(i)}
+                  onClick={() => removeItem(item.id)}
                   className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-xs text-white"
                   aria-label="Remove photo"
                 >
@@ -215,10 +337,10 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
 
       <button
         type="submit"
-        disabled={isSubmitting || isCompressing}
+        disabled={isSubmitting || hasUploadingItems}
         className="rounded-lg bg-brand-red px-4 py-2.5 text-sm font-semibold text-white transition hover:brightness-95 disabled:opacity-50"
       >
-        {isSubmitting ? "Submitting…" : "Submit report"}
+        {isSubmitting ? "Submitting…" : hasUploadingItems ? "Uploading photos…" : "Submit report"}
       </button>
     </form>
   );

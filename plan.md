@@ -82,6 +82,81 @@ view anything.
   history** (not just the current day) — a repeat-offender flag. Computed in
   `getPlateOccurrenceCounts()` in `src/lib/violations.ts`, only shown when
   count > 1 (first-time plates stay clean, no badge). See `PlateChip.tsx`.
+- **R2 folder/filename scheme**: one folder per day (`YYYYMMDD`), files
+  named with a running 2-digit sequence shared across every violation
+  reported that day (`01-full.jpg`, `01-thumb.jpg`, `02-full.jpg`, ...) —
+  cleaner to browse directly in the R2 dashboard than the original
+  `<violation-uuid>/<n>-full.jpg` layout. The sequence is reserved
+  atomically via a Postgres function (`reserve_daily_image_indexes`,
+  `0004_daily_image_sequence.sql`) rather than computed client-side, so two
+  people uploading on the same day can't land on the same number and
+  silently overwrite each other's photo in R2 (R2 `PutObject` to an existing
+  key overwrites with no warning). This is cosmetic/organizational only —
+  the app always reads images via the exact `image_path`/`thumb_path`
+  stored per row, never by guessing paths — so it's a forward-only change;
+  anything uploaded before it keeps working under its old path.
+- **Detail page shows the full photo, not a crop.** It originally used
+  `fill` + `object-cover` inside a fixed `aspect-[4/3]` box (same pattern as
+  the card grid's thumbnail), which crops any photo whose real aspect ratio
+  isn't 4:3 — a portrait phone photo would lose its edges. Fixed by using
+  each image's actual stored `width`/`height` (already captured by `sharp`
+  at upload time) for intrinsic sizing instead of `fill`, so the full image
+  renders at its true aspect ratio, scaled to the container width. The card
+  grid's thumbnail crop is intentional and unchanged — only the detail page
+  needed to show the uncropped original.
+- **Never call `redirect()` inside a Server Action invoked imperatively.**
+  This was a real bug: `createViolationAction`/`deleteViolationAction` are
+  called as plain `await someAction(...)` from client components, not via
+  `<form action={fn}>`. When such an action calls `redirect()`, the special
+  redirect signal surfaces as a normal thrown error to the *caller's own*
+  try/catch — so the user saw "Something went wrong" on every submission
+  even though the save had already fully succeeded server-side. Fix: these
+  actions now return a plain result object (`{ ok: true, ... } | { error }`)
+  and the client component calls `router.push()` itself on success. Applies
+  to `createViolationAction`, `deleteViolationAction`, and `signOutAction`.
+- **Photos upload immediately on pick, not at final submit.** Originally all
+  photos were bundled into one big request when the user clicked "Submit."
+  Two problems with that: (1) no way to show real per-file upload progress
+  since it's all-or-nothing, and (2) on Vercel, serverless functions have a
+  **hard ~4.5MB request body limit** that Next's own
+  `experimental.serverActions.bodySizeLimit` config *cannot* override — a
+  10-photo bulk upload would have still failed in production even after
+  raising that config earlier. Fix: `POST /api/upload-photo`
+  (`src/app/api/upload-photo/route.ts`) — a plain Route Handler, not a
+  Server Action, specifically so the client can use `XMLHttpRequest` (not
+  `fetch`, which has no upload-progress API) to track real byte-level
+  progress — accepts ONE compressed photo at a time, resizes it, reserves
+  its daily sequence number, uploads to R2, and returns
+  `{ imagePath, thumbPath, width, height }`. `UploadForm` kicks this off the
+  moment each photo is picked/compressed, rendering a progress bar overlay
+  per thumbnail (`UploadItem.status`: `uploading → done | error`, with
+  retry). Final "Submit report" no longer touches file bytes at all — it
+  just sends the already-uploaded image records + date/description/plates
+  as a plain object to `createViolationAction`, so `createViolation()` in
+  `violations.ts` is now a fast pure-DB-insert with no R2/sharp work in it.
+  (The `next.config.ts` 25MB Server Action body limit from earlier is
+  harmless to leave, just no longer load-bearing for the upload path.)
+- **Plate tag click-through.** Tapping a plate chip anywhere (card grid or
+  detail page) navigates to `/plates/[plate]`, showing every violation
+  that's ever had that normalized plate attached, grouped by date, newest
+  first. `PlateChip` itself stays a plain presentational component;
+  `PlateChipLink` wraps it with `router.push()` + `stopPropagation()` on
+  click rather than a real nested `<a>`, since it's used inside
+  `ViolationCard`'s own `<Link>` (nested anchors are invalid HTML).
+- **Timestamps rendered in Malaysia time, not server time.** Vercel's
+  runtime is UTC; without an explicit timezone, both "what date is today"
+  (used as the default day-view/upload date) and displayed timestamps would
+  silently use UTC once deployed — 8 hours off from Malaysia, even though
+  it looked correct in local dev (whatever timezone the dev machine happens
+  to be in). Fixed via `src/lib/datetime.ts` (`MALAYSIA_TIME_ZONE =
+  "Asia/Kuala_Lumpur"`, hardcoded — this is a single-country internal tool,
+  not worth an env var): `todayInMalaysia()` for date calculations,
+  `formatMalaysiaTime`/`formatMalaysiaDateTime` for display. Applied
+  everywhere a date/time was computed or rendered server-side, and even
+  client-side "today" calculations (calendar's default, upload form's max
+  date) now use this explicitly too — so a ViTrox employee checking the app
+  while travelling abroad still sees Malaysia's "today," not their current
+  location's.
 
 ## Data model
 
@@ -103,9 +178,13 @@ action, not a direct DML statement).
 
 Full DB schema + RLS: run in order —
 `0001_init.sql` → `0002_remove_reporter_tracking.sql` →
-`0003_reporter_ownership_for_delete.sql`. (0002 drops the reporter columns,
-0003 adds a *different* one back — both need to run, in that order, so the
-final column is `created_by_user_id`, not the original email/name pair.)
+`0003_reporter_ownership_for_delete.sql` → `0004_daily_image_sequence.sql`.
+(0002 drops the reporter columns, 0003 adds a *different* one back — both
+need to run, in that order, so the final column is `created_by_user_id`,
+not the original email/name pair. 0004 adds `daily_image_sequences` +
+`reserve_daily_image_indexes()`, a `security definer` function — the table
+has RLS enabled with **no policies**, so it's only reachable through that
+function, never direct client queries.)
 
 ## File map
 
@@ -120,21 +199,34 @@ final column is `created_by_user_id`, not the original email/name pair.)
 - `src/lib/r2.ts` — Cloudflare R2 upload + presigned URL helpers
   (`uploadToR2`, `getR2SignedUrl(s)`), S3-compatible API.
 - `src/lib/plate.ts` — `normalizePlate()`, shared client+server.
+- `src/lib/datetime.ts` — `todayInMalaysia()`, `formatMalaysiaTime`,
+  `formatMalaysiaDateTime` — Asia/Kuala_Lumpur-aware, used both server- and
+  client-side.
 - `src/lib/violations.ts` — data access layer: `getViolationsByDate`,
-  `getViolationById`, `createViolation`, `deleteViolation` (fetches image
-  paths + ownership, deletes DB row, then cleans up R2), plus
-  `getPlateOccurrenceCounts` (private helper).
+  `getViolationById`, `getViolationsByPlate`, `createViolation` (pure DB
+  insert now — image files are already uploaded before this runs),
+  `deleteViolation` (fetches image paths + ownership, deletes DB row, then
+  cleans up R2), plus `loadDetailsFor`/`getPlateOccurrenceCounts` (private
+  helpers).
 - `src/lib/types.ts` — shared TS types for the three tables + joined view
   (plates carry a computed `occurrenceCount`, not a DB column;
   `created_by_user_id` exists on `Violation` for ownership checks only).
-- `src/app/actions.ts` — Server Actions: `createViolationAction`,
-  `deleteViolationAction`, `signOutAction`.
+- `src/app/actions.ts` — Server Actions: `createViolationAction` (takes a
+  plain object, not FormData — images are pre-uploaded),
+  `deleteViolationAction`, `signOutAction`. None of these call `redirect()`
+  — see stack decisions above for why.
+- `src/app/api/upload-photo/route.ts` — Route Handler (not a Server Action)
+  that resizes + uploads ONE photo to R2 immediately on pick, returns its
+  path/dimensions; called via `XMLHttpRequest` from `UploadForm` for real
+  upload-progress events.
 - `src/app/(app)/` — authenticated route group (has the header):
   - `layout.tsx` — renders `Header`.
   - `page.tsx` — day view: `CalendarNav` at the top, `ViolationGrid` below,
     single column, reads `?date=`.
   - `upload/page.tsx` — report form.
   - `violations/[id]/page.tsx` — card detail / full gallery.
+  - `plates/[plate]/page.tsx` — every violation with a given normalized
+    plate, grouped by date.
 - `src/app/login/page.tsx`, `src/app/auth/callback/route.ts`,
   `src/app/auth/auth-error/page.tsx` — outside the authenticated group, no
   header.
@@ -142,11 +234,13 @@ final column is `created_by_user_id`, not the original email/name pair.)
   which dates have at least one violation (feeds the calendar's dots).
 - `src/components/` — `CalendarNav` (compact "Today"/date button that
   expands a `DayPicker` popover on click — collapsed by default, closes on
-  outside click/Escape/date select), `PlateChip` (plate + occurrence badge,
-  shared by card + detail views), `DeleteButton` (confirm dialog, calls
-  `deleteViolationAction`, only rendered on the detail page when
-  `user.id === violation.created_by_user_id`), `Header`, `GoogleSignInButton`,
-  `SignOutButton`, `UploadForm`, `ViolationCard`, `ViolationGrid`.
+  outside click/Escape/date select), `PlateChip` (presentational plate +
+  occurrence badge) / `PlateChipLink` (click-to-navigate wrapper used
+  everywhere `PlateChip` is actually rendered), `DeleteButton` (confirm
+  dialog, calls `deleteViolationAction`, then `router.push()` itself, only
+  rendered on the detail page when `user.id === violation.created_by_user_id`),
+  `Header`, `GoogleSignInButton`, `SignOutButton`, `UploadForm` (per-photo
+  upload state machine + progress bars), `ViolationCard`, `ViolationGrid`.
 
 ## Progress checkpoint
 
@@ -179,6 +273,22 @@ changes the user requested after initial setup:
 - [x] Delete-your-own-report feature: RLS delete policy + `deleteViolation`
       (DB row + cascade + R2 cleanup) + `DeleteButton` shown only to the
       report's own creator
+- [x] Per-day R2 folder/filename scheme (`YYYYMMDD/01-full.jpg`, atomic
+      counter via `0004_daily_image_sequence.sql`) — new uploads only, old
+      uploads keep their old path and still work
+- [x] Fixed cropped photo on the detail page (was `object-cover` in a fixed
+      4:3 box; now uses intrinsic width/height, no cropping)
+- [x] Fixed false "something went wrong" shown on every successful submit/
+      delete/sign-out (redirect-inside-imperative-Server-Action bug — see
+      stack decisions above)
+- [x] Photos now upload immediately on pick via a new Route Handler
+      (`/api/upload-photo`), with a real per-photo progress bar + retry on
+      each thumbnail; final submit just attaches already-uploaded images
+      (fast, no file bytes in that request anymore)
+- [x] Plate tag click-through: `/plates/[plate]`, grouped by date, newest
+      first — `PlateChipLink` wraps the existing `PlateChip`
+- [x] Fixed timestamps/date-defaults rendering in server (UTC on Vercel)
+      time instead of Malaysia time — `src/lib/datetime.ts`
 
 Verified so far:
 - `npm run build` and `npx eslint .` pass clean as of every change above
@@ -205,12 +315,14 @@ Verified so far:
 
 **Not yet verified (needs a human with real Google/Supabase access — an
 agent should not do these on the user's behalf):**
-- Running **all three** migrations against the real Supabase project, in
+- Running **all four** migrations against the real Supabase project, in
   order: `0001_init.sql` → `0002_remove_reporter_tracking.sql` →
-  `0003_reporter_ownership_for_delete.sql`. Not confirmed any of these have
-  been run yet — this is the top suspect for any "something went wrong
+  `0003_reporter_ownership_for_delete.sql` →
+  `0004_daily_image_sequence.sql`. Not confirmed any of these have been run
+  yet — this is the top suspect for any "something went wrong
   saving/deleting the report" error, since the schema may not match what the
-  code now expects.
+  code now expects. Without 0004 specifically, a new upload will fail
+  outright (the RPC function won't exist).
 - Whether the original "plate not shown on detail page" report was actually
   the missing-Add-click bug (now fixed) or something else — ask the user to
   retest with a fresh report, or check the `plate_numbers` table directly in
@@ -226,6 +338,49 @@ agent should not do these on the user's behalf):**
 - If an earlier `0001_init.sql` run created a `violation-images` Supabase
   Storage bucket, it's unused now — safe to delete from the Supabase
   dashboard to reclaim quota, not urgent.
+- None of this session's redirect-bug fix, per-photo upload/progress bars,
+  plate tag page, or Malaysia timezone fix have been exercised in a real
+  browser with real auth yet — all verified only via `npm run build` +
+  `npx eslint .` (both clean) and static code review. In particular:
+  confirm the progress bar actually advances and the thumbnail updates to
+  "done" per photo, confirm submitting no longer shows a false error,
+  confirm a plate chip tap navigates to `/plates/...` and shows the right
+  grouped history, and confirm a timestamp shown in the UI matches your
+  wall clock in Malaysia (this last one only really proves itself once
+  deployed to Vercel — local dev likely already runs in a Malaysia-ish
+  timezone, so the bug wouldn't have been visible locally anyway).
+
+## GitHub / deployment status
+
+- Remote: `origin` → `https://github.com/moybei/vvvvv-vip.git`, branch
+  `main`. **This repo is public** (confirmed).
+- A commit is currently **live on `origin/main`** authored as
+  `VITROX\haobei.moy <haobei.moy@vitrox.com>` — this was pushed from the
+  user's own terminal (not through this agent; the agent's own push attempt
+  was blocked by a safety classifier specifically because the destination
+  is public). No secrets are in it (`.env.local` was git-ignored the whole
+  time), but the ViTrox Windows username/email is publicly visible in the
+  commit metadata right now.
+- Locally, the user asked to change the commit author to `moybei
+  <moybei@users.noreply.github.com>` (their GitHub identity) instead. That
+  was done via `git commit --amend`, which **rewrote the commit hash**
+  (`e52d2df` → `16719f0`) — so local `main` and `origin/main` have now
+  diverged (1 commit each, same file contents, different author).
+- **Unresolved**: making the corrected author actually show up on GitHub
+  requires a force-push (`git push --force origin main`) to overwrite the
+  old commit. This was flagged to the user as a destructive/history-rewrite
+  action needing explicit confirmation before running — **not yet
+  confirmed or done** as of this checkpoint. Check with the user before
+  assuming either the old or new commit is "the" state of `origin/main`;
+  re-run `git fetch origin && git log origin/main -1 --format='%an <%ae> %H'`
+  to see current reality rather than trusting this note if time has passed.
+- Since that commit, **new local commits exist that have never been
+  pushed at all** (the per-day R2 naming scheme, the detail-page image crop
+  fix, migration 0004). Whatever git operation resolves the force-push
+  question should probably also get these up to GitHub — check `git log
+  origin/main..HEAD` for the full list of what's local-only.
+- Vercel itself hasn't been connected — that's a dashboard action only the
+  user can do (import the GitHub repo, set the env vars from `.env.local`).
 
 ## Environment
 
@@ -252,19 +407,32 @@ these — that one is a deliberate permanent privacy decision, not deferred.
 
 ## Next steps for whoever picks this up
 
-1. Confirm all three migrations have been run in Supabase's SQL editor, in
+1. Resolve the GitHub force-push question above with the user before
+   pushing anything else — don't just push local `main` and assume it's
+   fine, confirm which author identity they actually want live.
+2. Confirm all four migrations have been run in Supabase's SQL editor, in
    order: `0001_init.sql` → `0002_remove_reporter_tracking.sql` →
-   `0003_reporter_ownership_for_delete.sql`.
-2. If `npm run dev` hasn't been restarted since the `next.config.ts` body
+   `0003_reporter_ownership_for_delete.sql` →
+   `0004_daily_image_sequence.sql`.
+3. If `npm run dev` hasn't been restarted since the `next.config.ts` body
    size limit fix from earlier in this session, restart it now (Fast Refresh
    doesn't pick up config file changes).
-3. Sign in with a real `@vitrox.com` account and submit a real report with
-   photos + plates. Confirm the plate actually shows on the detail page. If
-   anything fails, check the terminal for `createViolationAction failed:` /
-   `deleteViolationAction failed:` — that'll have the real error now.
-4. Report the same plate twice (different violations) and confirm the
-   occurrence badge shows "2" on the repeat.
-5. On a report you created, confirm the Delete button appears on the detail
+4. Sign in with a real `@vitrox.com` account and submit a real report with
+   photos + plates. Confirm the plate actually shows on the detail page,
+   uncropped. Check the R2 bucket for the new `YYYYMMDD/01-full.jpg` layout.
+   If anything fails, check the terminal for `createViolationAction
+   failed:` / `deleteViolationAction failed:` — that'll have the real error.
+5. Report the same plate twice (different violations) and confirm the
+   occurrence badge shows "2" on the repeat, and that tapping either plate
+   chip navigates to `/plates/<plate>` showing both, grouped by date.
+6. On a report you created, confirm the Delete button appears on the detail
    page, and that deleting it removes the card, its DB rows, and its images
    in the R2 bucket (spot-check the bucket in the Cloudflare dashboard).
-6. Deploy to Vercel (`README.md` section 5) once local testing passes.
+   Confirm you land back on the day view afterward (not a stuck error).
+7. Confirm no more false "something went wrong" on a successful submit —
+   should navigate straight to the new card.
+8. Confirm each photo shows a real progress bar while uploading (not just a
+   generic spinner) and turns into a normal thumbnail once done.
+9. Push to GitHub and deploy to Vercel (`README.md` section 5) once local
+   testing passes — this is also the real test of the Malaysia-timezone fix,
+   since local dev likely never exhibited the bug.

@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
+import { MobileUserMenu } from "@/components/MobileUserMenu";
 import { SignOutButton } from "@/components/SignOutButton";
 
 export async function Header() {
@@ -26,12 +27,15 @@ export async function Header() {
             + Report
           </Link>
           {user && (
-            <div className="hidden items-center gap-2 sm:flex">
-              <span className="max-w-[12rem] truncate text-xs text-foreground/50">
-                {user.email}
-              </span>
-              <SignOutButton />
-            </div>
+            <>
+              <div className="hidden items-center gap-2 sm:flex">
+                <span className="max-w-[12rem] truncate text-xs text-foreground/50">
+                  {user.email}
+                </span>
+                <SignOutButton />
+              </div>
+              <MobileUserMenu email={user.email ?? null} />
+            </>
           )}
         </div>
       </div>

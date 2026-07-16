@@ -5,10 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { DayPicker } from "react-day-picker";
 import "react-day-picker/style.css";
 import { format, isValid, parseISO } from "date-fns";
-
-function todayStr() {
-  return format(new Date(), "yyyy-MM-dd");
-}
+import { todayInMalaysia } from "@/lib/datetime";
 
 export function CalendarNav() {
   const router = useRouter();
@@ -16,7 +13,7 @@ export function CalendarNav() {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const dateParam = searchParams.get("date");
-  const today = todayStr();
+  const today = todayInMalaysia();
   const selectedStr = dateParam && isValid(parseISO(dateParam)) ? dateParam : today;
   const selected = parseISO(selectedStr);
   const isToday = selectedStr === today;
@@ -107,7 +104,10 @@ export function CalendarNav() {
           {!isToday && (
             <button
               type="button"
-              onClick={() => goToDate(new Date())}
+              onClick={() => {
+                router.push(`/?date=${today}`);
+                setIsOpen(false);
+              }}
               className="mt-1 w-full rounded-lg px-2 py-1.5 text-center text-sm font-medium text-brand-red hover:bg-brand-red/5"
             >
               Back to today

@@ -26,6 +26,9 @@ Auth), Cloudflare R2 (image storage), deployed to Vercel.
      so someone can delete their own report but not anyone else's. This
      value is never shown anywhere in the UI — it's purely an internal
      ownership check, not a "reported by" feature.
+   - [`0004_daily_image_sequence.sql`](supabase/migrations/0004_daily_image_sequence.sql) —
+     adds an atomic counter function backing the per-day image naming scheme
+     (see "How images are handled" below).
 
 ## 2. Create the Cloudflare R2 bucket
 
@@ -96,13 +99,35 @@ to `/login`. Sign in with an `@vitrox.com` Google account.
 
 ## How images are handled
 
-Photos are downscaled in the browser before upload (`browser-image-compression`),
-then re-processed server-side with `sharp` (`src/lib/image.ts`) to a ~2500px
-longest-side JPEG plus a small thumbnail — enough resolution to read a plate,
-without storing multi-megapixel originals. Files are stored in a **private**
-Cloudflare R2 bucket (`src/lib/r2.ts`); the app reads them back via
-short-lived presigned URLs rather than public links, since this is internal
-company content.
+Each photo is downscaled in the browser (`browser-image-compression`) and
+then **uploads immediately, the moment it's picked** — not bundled together
+at final submit — via `POST /api/upload-photo`, a plain Route Handler
+(not a Server Action, so the browser's `XMLHttpRequest` can report real
+upload progress, which `fetch` can't). Each thumbnail shows a live progress
+bar while its upload is in flight, with a retry button if one fails. The
+server re-processes the photo with `sharp` (`src/lib/image.ts`) to a
+~2500px longest-side JPEG plus a small thumbnail — enough resolution to
+read a plate, without storing multi-megapixel originals — and stores both
+in a **private** Cloudflare R2 bucket (`src/lib/r2.ts`); the app reads them
+back via short-lived presigned URLs rather than public links, since this is
+internal company content. Submitting the form just attaches the
+already-uploaded image records to the new report — no file bytes are sent
+at that point, which also sidesteps Vercel's hard ~4.5MB request body limit
+for serverless functions (a limit Next's own config can't override, and
+which a bulk multi-photo request could otherwise hit).
+
+**R2 layout**: one folder per day, `YYYYMMDD/`, containing a running
+2-digit sequence shared by every violation reported that day —
+`01-full.jpg`/`01-thumb.jpg`, `02-full.jpg`/`02-thumb.jpg`, and so on,
+continuing across violations rather than restarting per report. The
+sequence is reserved atomically via a Postgres function
+(`reserve_daily_image_indexes`, `0004_daily_image_sequence.sql`) so two
+people uploading on the same day can't collide and overwrite each other's
+photo. This naming is cosmetic/organizational only — the app always reads
+images via the exact path stored per row in `violation_images`, never by
+guessing or listing a folder, so this only affects new uploads; anything
+uploaded before this change keeps its old `<violation-id>/<n>-full.jpg`
+path and still works.
 
 ## Deleting a report
 
@@ -117,6 +142,20 @@ can't be deleted through the UI by anyone (only via direct database access)
 — this is the safe default rather than making old rows deletable by
 everyone.
 
+## Plate tags
+
+Tapping a plate chip anywhere (card grid or detail page) opens
+`/plates/<plate>`, listing every violation ever reported against that exact
+normalized plate, grouped by date, newest first.
+
+## Timestamps
+
+The server runs in UTC on Vercel; without correcting for that, both
+timestamps and "what date is today" would silently be 8 hours off from
+Malaysia once deployed. `src/lib/datetime.ts` hardcodes
+`Asia/Kuala_Lumpur` and is used everywhere a date/time is computed or
+displayed, client- and server-side alike.
+
 ## Project structure
 
 - `src/proxy.ts` — Next.js 16's request proxy (formerly "middleware"); gates
@@ -125,14 +164,22 @@ everyone.
   session-refresh helper.
 - `src/lib/r2.ts` — Cloudflare R2 upload + presigned URL helpers (S3-compatible
   API via `@aws-sdk/client-s3`).
-- `src/lib/violations.ts` — data access layer (list by date, get by id,
-  create, delete). Postgres rows via Supabase, image bytes via R2.
+- `src/lib/violations.ts` — data access layer (list by date, get by id, get
+  by plate, create, delete). Postgres rows via Supabase; image bytes never
+  touch this file — they're already in R2 by the time it runs.
 - `src/lib/plate.ts` — `normalizePlate()`, so a plate is stored the same way
   regardless of spacing/casing on entry, and occurrence counts match up.
+- `src/lib/datetime.ts` — Malaysia-timezone-aware date/time helpers.
+- `src/app/api/upload-photo/route.ts` — per-photo upload endpoint (resize +
+  R2 upload + sequence numbering), called via XHR for progress tracking.
 - `src/app/(app)/` — authenticated pages: day view (`page.tsx`), `upload/`,
-  `violations/[id]/` (shows a Delete button to the report's own creator).
+  `violations/[id]/` (shows a Delete button to the report's own creator),
+  `plates/[plate]/` (all reports for one plate, grouped by date).
 - `src/app/actions.ts` — Server Actions for creating/deleting a report and
-  signing out.
+  signing out. None of them call `redirect()` — see the note in the app's
+  internal `plan.md` if you're wondering why; the short version is that
+  doing so from an action called imperatively (not via `<form>`) makes a
+  successful action look like it failed to the caller.
 
 Not built yet (straightforward to add later on the same schema): editing a
-report, comments, and search by plate number.
+report, comments, and search across multiple plates at once.

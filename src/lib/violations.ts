@@ -1,7 +1,6 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { processUploadedImage } from "@/lib/image";
-import { deleteFromR2, getR2SignedUrls, uploadToR2 } from "@/lib/r2";
+import { deleteFromR2, getR2SignedUrls } from "@/lib/r2";
 import type {
   PlateNumberRow,
   Violation,
@@ -71,6 +70,25 @@ async function attachSignedUrls(
   });
 }
 
+async function loadDetailsFor(
+  supabase: SupabaseClient,
+  violations: Violation[],
+): Promise<ViolationWithDetails[]> {
+  if (!violations.length) return [];
+
+  const ids = violations.map((v) => v.id);
+  const [{ data: images, error: imgErr }, { data: plates, error: plateErr }] =
+    await Promise.all([
+      supabase.from("violation_images").select("*").in("violation_id", ids),
+      supabase.from("plate_numbers").select("*").in("violation_id", ids),
+    ]);
+
+  if (imgErr) throw imgErr;
+  if (plateErr) throw plateErr;
+
+  return attachSignedUrls(supabase, violations, images ?? [], plates ?? []);
+}
+
 export async function getViolationsByDate(
   supabase: SupabaseClient,
   date: string,
@@ -82,20 +100,7 @@ export async function getViolationsByDate(
     .order("created_at", { ascending: false });
 
   if (error) throw error;
-  if (!violations?.length) return [];
-
-  const ids = violations.map((v) => v.id);
-
-  const [{ data: images, error: imgErr }, { data: plates, error: plateErr }] =
-    await Promise.all([
-      supabase.from("violation_images").select("*").in("violation_id", ids),
-      supabase.from("plate_numbers").select("*").in("violation_id", ids),
-    ]);
-
-  if (imgErr) throw imgErr;
-  if (plateErr) throw plateErr;
-
-  return attachSignedUrls(supabase, violations, images ?? [], plates ?? []);
+  return loadDetailsFor(supabase, violations ?? []);
 }
 
 export async function getViolationById(
@@ -111,17 +116,34 @@ export async function getViolationById(
   if (error) throw error;
   if (!violation) return null;
 
-  const [{ data: images, error: imgErr }, { data: plates, error: plateErr }] =
-    await Promise.all([
-      supabase.from("violation_images").select("*").eq("violation_id", id),
-      supabase.from("plate_numbers").select("*").eq("violation_id", id),
-    ]);
+  const [full] = await loadDetailsFor(supabase, [violation]);
+  return full ?? null;
+}
 
-  if (imgErr) throw imgErr;
-  if (plateErr) throw plateErr;
+// Every violation that has ever had this exact normalized plate attached,
+// newest first — powers the plate tag click-through page.
+export async function getViolationsByPlate(
+  supabase: SupabaseClient,
+  plateText: string,
+): Promise<ViolationWithDetails[]> {
+  const { data: matches, error: matchErr } = await supabase
+    .from("plate_numbers")
+    .select("violation_id")
+    .eq("plate_text", plateText);
+  if (matchErr) throw matchErr;
 
-  const [full] = await attachSignedUrls(supabase, [violation], images ?? [], plates ?? []);
-  return full;
+  const violationIds = Array.from(new Set((matches ?? []).map((m) => m.violation_id)));
+  if (violationIds.length === 0) return [];
+
+  const { data: violations, error } = await supabase
+    .from("violations")
+    .select("*")
+    .in("id", violationIds)
+    .order("violation_date", { ascending: false })
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+
+  return loadDetailsFor(supabase, violations ?? []);
 }
 
 export async function createViolation(
@@ -130,7 +152,7 @@ export async function createViolation(
     date: string;
     description: string;
     plates: string[];
-    files: File[];
+    images: { imagePath: string; thumbPath: string; width: number; height: number }[];
     createdByUserId: string;
   },
 ): Promise<string> {
@@ -157,27 +179,17 @@ export async function createViolation(
     if (plateErr) throw plateErr;
   }
 
-  for (let i = 0; i < params.files.length; i++) {
-    const file = params.files[i];
-    const inputBuffer = Buffer.from(await file.arrayBuffer());
-    const { full, thumb } = await processUploadedImage(inputBuffer);
-
-    const imagePath = `${violationId}/${i}-full.jpg`;
-    const thumbPath = `${violationId}/${i}-thumb.jpg`;
-
-    await Promise.all([
-      uploadToR2(imagePath, full.buffer, "image/jpeg"),
-      uploadToR2(thumbPath, thumb.buffer, "image/jpeg"),
-    ]);
-
-    const { error: imgErr } = await supabase.from("violation_images").insert({
-      violation_id: violationId,
-      image_path: imagePath,
-      thumb_path: thumbPath,
-      width: full.width,
-      height: full.height,
-      sort_order: i,
-    });
+  if (params.images.length) {
+    const { error: imgErr } = await supabase.from("violation_images").insert(
+      params.images.map((img, i) => ({
+        violation_id: violationId,
+        image_path: img.imagePath,
+        thumb_path: img.thumbPath,
+        width: img.width,
+        height: img.height,
+        sort_order: i,
+      })),
+    );
     if (imgErr) throw imgErr;
   }
 

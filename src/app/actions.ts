@@ -1,6 +1,5 @@
 "use server";
 
-import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 import { isAllowedEmail } from "@/lib/auth";
@@ -8,56 +7,53 @@ import { normalizePlate } from "@/lib/plate";
 import { createViolation, deleteViolation } from "@/lib/violations";
 
 const MAX_IMAGES = 10;
-const MAX_FILE_BYTES = 15 * 1024 * 1024; // 15MB per file, pre-resize on the client already shrinks this a lot
 
-export async function createViolationAction(
-  formData: FormData,
-): Promise<{ error: string } | void> {
+// Note: these actions are called imperatively from client components
+// (`await someAction(...)`, not `<form action={someAction}>`), so they
+// deliberately never call redirect() themselves — when a Server Action
+// invoked that way calls redirect(), the thrown redirect signal surfaces
+// as a normal rejected promise to the caller's own try/catch, which read as
+// a generic failure even though the save/delete had already succeeded.
+// Instead these return a plain result and the client navigates itself.
+
+export async function createViolationAction(input: {
+  date: string;
+  description: string;
+  plates: string[];
+  images: { imagePath: string; thumbPath: string; width: number; height: number }[];
+}): Promise<{ ok: true; date: string; violationId: string } | { error: string }> {
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
 
   if (!user || !isAllowedEmail(user.email)) {
-    redirect("/login");
+    return { error: "Your session expired. Please refresh and sign in again." };
   }
 
-  const date = String(formData.get("date") ?? "");
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input.date)) {
     return { error: "Missing or invalid date." };
   }
 
-  const description = String(formData.get("description") ?? "").trim();
+  const description = input.description.trim();
+  const plates = Array.from(new Set(input.plates.map(normalizePlate).filter(Boolean)));
+  const images = input.images;
 
-  const plates = Array.from(
-    new Set(
-      formData
-        .getAll("plates")
-        .map((p) => normalizePlate(String(p)))
-        .filter(Boolean),
-    ),
-  );
-
-  const files = formData.getAll("images").filter((f): f is File => f instanceof File && f.size > 0);
-
-  if (files.length === 0) {
+  if (images.length === 0) {
     return { error: "At least one photo is required." };
   }
-  if (files.length > MAX_IMAGES) {
+  if (images.length > MAX_IMAGES) {
     return { error: `Please upload at most ${MAX_IMAGES} photos.` };
-  }
-  if (files.some((f) => f.size > MAX_FILE_BYTES)) {
-    return { error: "One of the photos is too large." };
   }
 
   let violationId: string;
   try {
     violationId = await createViolation(supabase, {
-      date,
+      date: input.date,
       description,
       plates,
-      files,
-      createdByUserId: user!.id,
+      images,
+      createdByUserId: user.id,
     });
   } catch (err) {
     console.error("createViolationAction failed:", err);
@@ -65,24 +61,24 @@ export async function createViolationAction(
   }
 
   revalidatePath("/");
-  redirect(`/?date=${date}#${violationId}`);
+  return { ok: true, date: input.date, violationId };
 }
 
 export async function deleteViolationAction(
   violationId: string,
-): Promise<{ error: string } | void> {
+): Promise<{ ok: true; date: string } | { error: string }> {
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
 
   if (!user || !isAllowedEmail(user.email)) {
-    redirect("/login");
+    return { error: "Your session expired. Please refresh and sign in again." };
   }
 
   let result: { ok: true; date: string } | { ok: false; error: string };
   try {
-    result = await deleteViolation(supabase, violationId, user!.id);
+    result = await deleteViolation(supabase, violationId, user.id);
   } catch (err) {
     console.error("deleteViolationAction failed:", err);
     return { error: "Something went wrong deleting the report. Please try again." };
@@ -93,11 +89,11 @@ export async function deleteViolationAction(
   }
 
   revalidatePath("/");
-  redirect(`/?date=${result.date}`);
+  return { ok: true, date: result.date };
 }
 
-export async function signOutAction() {
+export async function signOutAction(): Promise<{ ok: true }> {
   const supabase = await createClient();
   await supabase.auth.signOut();
-  redirect("/login");
+  return { ok: true };
 }

@@ -2,7 +2,8 @@ import Image from "next/image";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { DeleteButton } from "@/components/DeleteButton";
-import { PlateChip } from "@/components/PlateChip";
+import { PlateChipLink } from "@/components/PlateChipLink";
+import { formatMalaysiaDateTime } from "@/lib/datetime";
 import { createClient } from "@/lib/supabase/server";
 import { getViolationById } from "@/lib/violations";
 
@@ -31,15 +32,16 @@ export default async function ViolationDetailPage({
         ← Back to {violation.violation_date}
       </Link>
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="flex flex-col items-center gap-3">
         {violation.images.map((img) => (
-          <div key={img.id} className="relative aspect-[4/3] overflow-hidden rounded-xl bg-surface-muted">
+          <div key={img.id} className="w-full max-w-md overflow-hidden rounded-xl bg-surface-muted">
             <Image
               src={img.url}
               alt="Violation photo"
-              fill
-              sizes="(max-width: 640px) 100vw, 50vw"
-              className="object-cover"
+              width={img.width}
+              height={img.height}
+              sizes="(max-width: 448px) 100vw, 448px"
+              className="h-auto w-full"
               unoptimized
             />
           </div>
@@ -49,7 +51,7 @@ export default async function ViolationDetailPage({
       {violation.plates.length > 0 && (
         <div className="mt-5 flex flex-wrap gap-2">
           {violation.plates.map((p) => (
-            <PlateChip key={p.id} plateText={p.plate_text} occurrenceCount={p.occurrenceCount} size="lg" />
+            <PlateChipLink key={p.id} plateText={p.plate_text} occurrenceCount={p.occurrenceCount} size="lg" />
           ))}
         </div>
       )}
@@ -59,7 +61,7 @@ export default async function ViolationDetailPage({
       </p>
 
       <p className="mt-6 text-xs text-foreground/45">
-        Reported {new Date(violation.created_at).toLocaleString()}
+        Reported {formatMalaysiaDateTime(violation.created_at)}
       </p>
 
       {isOwner && <DeleteButton violationId={violation.id} />}

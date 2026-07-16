@@ -1,4 +1,4 @@
-import { format } from "date-fns";
+import { todayInMalaysia } from "@/lib/datetime";
 import { UploadForm } from "@/components/UploadForm";
 
 export default function UploadPage() {
@@ -8,7 +8,7 @@ export default function UploadPage() {
       <p className="mb-6 text-sm text-foreground/60">
         Add photos, the plate number(s), and a quick description.
       </p>
-      <UploadForm defaultDate={format(new Date(), "yyyy-MM-dd")} />
+      <UploadForm defaultDate={todayInMalaysia()} />
     </div>
   );
 }
