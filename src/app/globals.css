@@ -1,21 +1,33 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #faf9f6;
+  --foreground: #1a1a1a;
+  --surface: #ffffff;
+  --surface-muted: #f2f1ec;
+  --brand-yellow: #ffc72c;
+  --brand-red: #e0392b;
+  --brand-dark: #1a1a1a;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-brand-yellow: var(--brand-yellow);
+  --color-brand-red: var(--brand-red);
+  --color-brand-dark: var(--brand-dark);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
+    --background: #121212;
     --foreground: #ededed;
+    --surface: #1c1c1e;
+    --surface-muted: #232325;
   }
 }
 
@@ -23,4 +35,27 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+.vip-calendar {
+  --rdp-accent-color: var(--brand-red);
+  --rdp-accent-background-color: color-mix(in srgb, var(--brand-yellow) 35%, transparent);
+  --rdp-today-color: var(--brand-red);
+}
+
+.vip-calendar .rdp-has-entry:not(.rdp-selected) button {
+  position: relative;
+}
+
+.vip-calendar .rdp-has-entry:not(.rdp-selected) button::after {
+  content: "";
+  position: absolute;
+  bottom: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: var(--brand-yellow);
+  border: 1px solid var(--brand-dark);
 }
