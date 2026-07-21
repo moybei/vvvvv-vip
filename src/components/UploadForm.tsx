@@ -77,8 +77,10 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
   const xhrById = useRef(new Map<string, XMLHttpRequest>());
   const itemsRef = useRef<UploadItem[]>([]);
+  const handleFilesRef = useRef<(files: FileList | File[] | null) => void>(() => {});
 
   useEffect(() => {
     itemsRef.current = items;
@@ -90,6 +92,35 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
       itemsRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl));
       xhrMap.forEach((xhr) => xhr.abort());
     };
+  }, []);
+
+  useEffect(() => {
+    function onPaste(e: ClipboardEvent) {
+      if (!e.clipboardData) return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable) {
+          // Let the user paste text into inputs/textareas normally.
+          const hasImage = Array.from(e.clipboardData.items).some((it) =>
+            it.type.startsWith("image/"),
+          );
+          if (!hasImage) return;
+        }
+      }
+      const files: File[] = [];
+      for (const item of Array.from(e.clipboardData.items)) {
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (files.length === 0) return;
+      e.preventDefault();
+      handleFilesRef.current(files);
+    }
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
   }, []);
 
   function updateItem(id: string, patch: Partial<UploadItem>) {
@@ -109,11 +140,13 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
       .finally(() => xhrById.current.delete(id));
   }
 
-  async function handleFilesSelected(fileList: FileList | null) {
-    if (!fileList || fileList.length === 0) return;
+  async function handleFilesSelected(fileList: FileList | File[] | null) {
+    if (!fileList) return;
+    const files = Array.from(fileList);
+    if (files.length === 0) return;
     setError(null);
 
-    for (const file of Array.from(fileList)) {
+    for (const file of files) {
       const id = crypto.randomUUID();
       let compressed: File;
       try {
@@ -131,7 +164,12 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
     }
 
     if (fileInputRef.current) fileInputRef.current.value = "";
+    if (cameraInputRef.current) cameraInputRef.current.value = "";
   }
+
+  useEffect(() => {
+    handleFilesRef.current = (files) => handleFilesSelected(files);
+  });
 
   function removeItem(id: string) {
     xhrById.current.get(id)?.abort();
@@ -219,16 +257,34 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
 
       <div>
         <label className="mb-1 block text-sm font-medium">Photos</label>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*"
-          multiple
-          onChange={(e) => handleFilesSelected(e.target.files)}
-          className="block w-full text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-brand-yellow file:px-3 file:py-2 file:text-sm file:font-semibold file:text-brand-dark"
-        />
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={(e) => handleFilesSelected(e.target.files)}
+            className="block w-full text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-brand-yellow file:px-3 file:py-2 file:text-sm file:font-semibold file:text-brand-dark sm:w-auto"
+          />
+          <input
+            ref={cameraInputRef}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            onChange={(e) => handleFilesSelected(e.target.files)}
+            className="hidden"
+          />
+          <button
+            type="button"
+            onClick={() => cameraInputRef.current?.click()}
+            className="rounded-lg border border-black/10 px-3 py-2 text-sm font-medium hover:bg-surface-muted dark:border-white/15"
+          >
+            📷 Take photo
+          </button>
+        </div>
         <p className="mt-1 text-xs text-foreground/50">
-          Photos start uploading as soon as you pick them.
+          Photos start uploading as soon as you pick them. You can also paste (Ctrl/Cmd+V) a
+          screenshot from your clipboard.
         </p>
         {items.length > 0 && (
           <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
