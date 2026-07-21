@@ -171,12 +171,29 @@ export function UploadForm({ defaultDate }: { defaultDate: string }) {
     handleFilesRef.current = (files) => handleFilesSelected(files);
   });
 
+  function deleteUploadedFromR2(result: UploadResult) {
+    const paths = [result.imagePath, result.thumbPath];
+    void fetch("/api/upload-photo", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths }),
+      keepalive: true,
+    }).catch(() => {
+      // Best-effort cleanup — a failed delete just leaves an orphan in R2.
+    });
+  }
+
   function removeItem(id: string) {
     xhrById.current.get(id)?.abort();
     xhrById.current.delete(id);
     setItems((prev) => {
       const target = prev.find((item) => item.id === id);
-      if (target) URL.revokeObjectURL(target.previewUrl);
+      if (target) {
+        URL.revokeObjectURL(target.previewUrl);
+        if (target.status === "done" && target.result) {
+          deleteUploadedFromR2(target.result);
+        }
+      }
       return prev.filter((item) => item.id !== id);
     });
   }
