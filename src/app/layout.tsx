@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
@@ -15,6 +15,14 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "VIP — ViTrox Interesting Parking",
   description: "Internal wall of shame for annoying parking around ViTrox.",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  // Prevents iOS Safari from auto-zooming when a small-font input is focused.
+  // Modern iOS still lets users pinch-zoom manually, so accessibility is preserved.
+  maximumScale: 1,
 };
 
 export default function RootLayout({
